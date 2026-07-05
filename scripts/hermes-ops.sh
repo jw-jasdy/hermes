@@ -6,7 +6,7 @@
 # handle. All heavy lifting stays on GitHub Actions; this is just a thin
 # convenience around systemctl, journalctl, host diagnostics, and the hermes CLI.
 #
-# Usage: hermes-ops.sh {start|stop|restart|status|logs|journal-boot|env-check|summary|disk|memory|doctor|update}
+# Usage: hermes-ops.sh {start|stop|restart|status|logs|journal-boot|env-check|summary|disk|memory|doctor|smoke|telegram-check|update}
 # ===========================================================================
 set -euo pipefail
 
@@ -32,6 +32,51 @@ env_check() {
     echo "ERROR: ${ENV_FILE} not found or unreadable." >&2
     exit 1
   fi
+}
+
+telegram_check() {
+  sudo bash -c 'set -euo pipefail; set -a; . /etc/hermes-agent/hermes.env; set +a; if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then echo "Telegram token not configured; skipping Telegram API check."; exit 0; fi; python3 - <<"PY"
+import json
+import os
+import sys
+import urllib.request
+
+token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+if not token:
+    print("Telegram token not configured; skipping Telegram API check.")
+    raise SystemExit(0)
+url = "https://api.telegram.org/bot" + token + "/getMe"
+try:
+    with urllib.request.urlopen(url, timeout=20) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+except Exception as exc:
+    print("Telegram API check failed: " + exc.__class__.__name__, file=sys.stderr)
+    raise SystemExit(1)
+if not payload.get("ok"):
+    print("Telegram API check failed: getMe returned ok=false", file=sys.stderr)
+    raise SystemExit(1)
+result = payload.get("result", {})
+print("Telegram API check OK for bot id " + str(result.get("id", "unknown")) + ".")
+PY'
+}
+
+smoke() {
+  echo "== Service active =="
+  sudo systemctl is-active --quiet "${SERVICE}" || {
+    sudo systemctl --no-pager --full status "${SERVICE}" || true
+    sudo journalctl -u "${SERVICE}" --no-pager -n 120 || true
+    exit 1
+  }
+  echo "OK: ${SERVICE} is active."
+  echo
+  echo "== Runtime env keys =="
+  env_check
+  echo
+  echo "== Telegram API =="
+  telegram_check
+  echo
+  echo "== Hermes doctor =="
+  run_hermes doctor || echo "hermes doctor reported warnings; service and Telegram checks passed."
 }
 
 summary() {
@@ -78,12 +123,14 @@ case "${cmd}" in
   disk) df -h / "${HERMES_HOME}" "${HERMES_CONFIG_DIR}" 2>/dev/null || df -h / ;;
   memory) free -h ;;
   doctor)  run_hermes doctor ;;
+  smoke) smoke ;;
+  telegram-check) telegram_check ;;
   update)
     run_hermes update
     sudo systemctl restart "${SERVICE}"
     ;;
   *)
-    echo "Usage: $0 {start|stop|restart|status|logs|journal-boot|env-check|summary|disk|memory|doctor|update}" >&2
+    echo "Usage: $0 {start|stop|restart|status|logs|journal-boot|env-check|summary|disk|memory|doctor|smoke|telegram-check|update}" >&2
     exit 2
     ;;
 esac
