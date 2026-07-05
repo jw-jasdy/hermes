@@ -98,6 +98,20 @@ jobs:
           PROJECT_ID="${{ steps.cfg.outputs.project_id }}"
           SA_EMAIL="$(jq -r '.client_email' "${GOOGLE_APPLICATION_CREDENTIALS}")"
           [ -n "${SA_EMAIL}" ] && [ "${SA_EMAIL}" != "null" ] || { echo "Could not resolve deploy SA email"; exit 1; }
+
+          # Preflight: reading the project uses the Cloud Resource Manager API, the
+          # same API that setIamPolicy needs. If it is disabled, fail fast with the
+          # exact one-time remediation instead of a cryptic mid-loop 403.
+          if ! gcloud projects describe "${PROJECT_ID}" >/dev/null 2>&1; then
+            echo "ERROR: Cannot read project ${PROJECT_ID}. The Cloud Resource Manager" >&2
+            echo "API is almost certainly disabled, and this service account cannot"    >&2
+            echo "enable it itself (that needs serviceUsageAdmin, obtainable only via"   >&2
+            echo "the IAM grant below -- a circular bootstrap). A project Owner must"    >&2
+            echo "run this ONCE, then re-run the workflow:"                              >&2
+            echo "  gcloud services enable cloudresourcemanager.googleapis.com --project=${PROJECT_ID}" >&2
+            exit 1
+          fi
+
           echo "Ensuring IAM roles for ${SA_EMAIL} on ${PROJECT_ID}"
           for ROLE in \
             roles/serviceusage.serviceUsageAdmin \
@@ -185,7 +199,20 @@ jobs:
 
       - name: Terraform apply (bootstrap — temporary external IP)
         working-directory: terraform
-        run: terraform apply -input=false -auto-approve -var="allow_temporary_external_ip=true"
+        run: |
+          set -euo pipefail
+          # The operational roles self-granted above and the freshly enabled APIs
+          # can take a short while to propagate, so the first apply may hit a
+          # transient 403 (permission not yet active, or the post-enable API race).
+          # terraform apply is convergent, so retry a couple of times before failing.
+          for attempt in 1 2 3; do
+            if terraform apply -input=false -auto-approve -var="allow_temporary_external_ip=true"; then
+              exit 0
+            fi
+            echo "terraform apply attempt ${attempt}/3 failed; waiting for IAM/API propagation..."
+            sleep 30
+          done
+          echo "terraform apply failed after retries"; exit 1
 
       - name: Render env file and systemd unit
         id: render
