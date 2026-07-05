@@ -44,6 +44,18 @@ sudo install -d -o "${HERMES_USER}" -g "${HERMES_USER}" -m 0700 "${HERMES_CONFIG
 sudo install -d -o "${HERMES_USER}" -g "${HERMES_USER}" -m 0700 "${HERMES_STATE_DIR}"
 sudo install -o "${HERMES_USER}" -g "${HERMES_USER}" -m 0600 "${SYSTEM_ENV_FILE}" "${HERMES_DOTENV}"
 
+# Upstream doctor still has a generic raw-text provider marker check that does
+# not count Gemini's key names. The provider-specific Gemini check is the real
+# credential check; this empty marker only prevents the stale generic setup
+# summary when no other provider marker is present. If a real NOUS_API_KEY is
+# supplied through extra env/secrets, it is preserved and this block is skipped.
+if ! sudo grep -Eq '^(OPENROUTER_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|ANTHROPIC_TOKEN|OPENAI_BASE_URL|NOUS_API_KEY|GLM_API_KEY|ZAI_API_KEY|Z_AI_API_KEY|KIMI_API_KEY|KIMI_CN_API_KEY|GMI_API_KEY|MINIMAX_API_KEY|MINIMAX_CN_API_KEY|KILOCODE_API_KEY|DEEPSEEK_API_KEY|DASHSCOPE_API_KEY|HF_TOKEN|OPENCODE_ZEN_API_KEY|OPENCODE_GO_API_KEY|XIAOMI_API_KEY|TOKENHUB_API_KEY)=' "${HERMES_DOTENV}"; then
+  printf '\n# Compatibility marker for Hermes doctor generic provider detection.\nNOUS_API_KEY=\n' \
+    | sudo tee -a "${HERMES_DOTENV}" >/dev/null
+  sudo chown "${HERMES_USER}:${HERMES_USER}" "${HERMES_DOTENV}"
+  sudo chmod 0600 "${HERMES_DOTENV}"
+fi
+
 # Apply Hermes config migrations once credentials are visible in the profile.
 # Non-fatal: a doctor warning should not prevent systemd from restarting, and
 # the follow-up health check/debug action will still expose remaining issues.
