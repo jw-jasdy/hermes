@@ -33,6 +33,15 @@ run_hermes() {
     "${HERMES_BIN}" "$@"
 }
 
+append_model_block() {
+  sudo -u "${HERMES_USER}" tee -a "${CONFIG_FILE}" >/dev/null <<YAML
+model:
+  default: ${HERMES_MODEL}
+  provider: gemini
+  base_url: ${GEMINI_BASE_URL}
+YAML
+}
+
 log "Selecting Gemini provider and model '${HERMES_MODEL}'..."
 # Primary path: the documented non-interactive CLI, all as dotted keys under
 # the same `model:` block (per the official config.yaml schema: `default`,
@@ -56,19 +65,16 @@ if sudo -u "${HERMES_USER}" grep -Eq '^model:[[:space:]]*$' "${CONFIG_FILE}" 2>/
   log "Gemini provider recorded in config.yaml."
 elif sudo -u "${HERMES_USER}" grep -Eq '^model:[[:space:]]*$' "${CONFIG_FILE}" 2>/dev/null; then
   log "WARNING: config.yaml has a model block that deploy could not verify. Rewriting model block for Gemini."
-  sudo -u "${HERMES_USER}" awk '
+  tmp_file="$(mktemp)"
+  awk '
     BEGIN { skip=0 }
     /^model:[[:space:]]*$/ { skip=1; next }
     skip && /^[^[:space:]]/ { skip=0 }
     !skip { print }
-  ' "${CONFIG_FILE}" >"${CONFIG_FILE}.tmp"
-  sudo -u "${HERMES_USER}" mv "${CONFIG_FILE}.tmp" "${CONFIG_FILE}"
-  sudo -u "${HERMES_USER}" tee -a "${CONFIG_FILE}" >/dev/null <<YAML
-model:
-  default: ${HERMES_MODEL}
-  provider: gemini
-  base_url: ${GEMINI_BASE_URL}
-YAML
+  ' "${CONFIG_FILE}" >"${tmp_file}"
+  install -o "${HERMES_USER}" -g "${HERMES_USER}" -m 0600 "${tmp_file}" "${CONFIG_FILE}"
+  rm -f "${tmp_file}"
+  append_model_block
 else
   # No model key at all, OR model: is a bad flat scalar (e.g. left over from
   # an older version of this script that used a bare, non-dotted `config set
@@ -77,12 +83,7 @@ else
   # block fresh.
   log "No usable model block found; writing the documented one directly."
   sudo -u "${HERMES_USER}" sed -i '/^model:[[:space:]]*[^[:space:]]/d' "${CONFIG_FILE}" 2>/dev/null || true
-  sudo -u "${HERMES_USER}" tee -a "${CONFIG_FILE}" >/dev/null <<YAML
-model:
-  default: ${HERMES_MODEL}
-  provider: gemini
-  base_url: ${GEMINI_BASE_URL}
-YAML
+  append_model_block
 fi
 
 sudo -u "${HERMES_USER}" grep -q 'provider: *gemini' "${CONFIG_FILE}"
