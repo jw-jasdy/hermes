@@ -127,16 +127,17 @@ jobs:
           # Cloud Resource Manager API (enabled in the previous step) and setIamPolicy
           # (roles/resourcemanager.projectIamAdmin, pre-granted to the SA). Roles and
           # the operations that need them:
-          #   projectIamAdmin          - self-grant these bindings
-          #   serviceUsageAdmin        - gcloud services enable (previous step)
-          #   storage.admin            - create the TF state bucket + read/write state
-          #   compute.admin            - VPC/subnet/firewall/instance + instance IAM
-          #   iam.serviceAccountAdmin  - create the VM's dedicated service account
-          #   iam.serviceAccountUser   - actAs that SA to attach it to the VM
-          #   iap.admin                - IAP tunnel instance IAM + open the SSH tunnel
-          #   compute.osAdminLogin     - SSH into the VM as an OS Login admin (project
-          #                              wide, so login does not depend on Terraform's
-          #                              per-instance binding having propagated yet)
+          #   projectIamAdmin             - self-grant these bindings
+          #   serviceUsageAdmin           - gcloud services enable (previous step)
+          #   storage.admin               - create the TF state bucket + read/write state
+          #   compute.admin               - VPC/subnet/firewall/instance + instance IAM
+          #   iam.serviceAccountAdmin     - create the VM's dedicated service account
+          #   iam.serviceAccountUser      - actAs that SA to attach it to the VM
+          #   iap.admin                   - manage IAP tunnel instance IAM bindings
+          #   iap.tunnelResourceAccessor  - open the SSH tunnel through IAP
+          #   compute.osAdminLogin        - SSH into the VM as an OS Login admin (project
+          #                                 wide, so login does not depend on Terraform's
+          #                                 per-instance binding having propagated yet)
           PROJECT_ID="${{ steps.cfg.outputs.project_id }}"
           SA_EMAIL="$(jq -r '.client_email' "${GOOGLE_APPLICATION_CREDENTIALS}")"
           [ -n "${SA_EMAIL}" ] && [ "${SA_EMAIL}" != "null" ] || { echo "Could not resolve deploy SA email"; exit 1; }
@@ -152,6 +153,7 @@ jobs:
               roles/iam.serviceAccountAdmin \
               roles/iam.serviceAccountUser \
               roles/iap.admin \
+              roles/iap.tunnelResourceAccessor \
               roles/compute.osAdminLogin; do
               gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
                 --member="serviceAccount:${SA_EMAIL}" \
