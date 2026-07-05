@@ -81,6 +81,30 @@ jobs:
             echo "state_bucket=${STATE_BUCKET}"
           } >> "${GITHUB_OUTPUT}"
 
+      - name: Bootstrap deploy service account IAM roles
+        run: |
+          set -euo pipefail
+          # The deploy SA is bootstrapped with roles/resourcemanager.projectIamAdmin
+          # (setIamPolicy) only. Self-grant the operational roles the rest of the
+          # deploy needs so the pipeline is self-contained. add-iam-policy-binding
+          # is idempotent, so re-runs are no-ops once the bindings exist.
+          PROJECT_ID="${{ steps.cfg.outputs.project_id }}"
+          SA_EMAIL="$(jq -r '.client_email' "${GOOGLE_APPLICATION_CREDENTIALS}")"
+          [ -n "${SA_EMAIL}" ] && [ "${SA_EMAIL}" != "null" ] || { echo "Could not resolve deploy SA email"; exit 1; }
+          echo "Ensuring IAM roles for ${SA_EMAIL} on ${PROJECT_ID}"
+          for ROLE in \
+            roles/serviceusage.serviceUsageAdmin \
+            roles/compute.admin \
+            roles/iam.serviceAccountAdmin \
+            roles/iam.serviceAccountUser \
+            roles/iap.admin; do
+            gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+              --member="serviceAccount:${SA_EMAIL}" \
+              --role="${ROLE}" \
+              --condition=None \
+              --quiet >/dev/null
+          done
+
       - name: Enable required GCP APIs
         run: |
           set -euo pipefail
@@ -89,12 +113,21 @@ jobs:
           # the project. Enabling is idempotent and blocks until complete; doing
           # it before the lengthy terraform init/plan also lets the activation
           # propagate before the first apply (avoids the post-enable 403 race).
-          gcloud services enable \
-            compute.googleapis.com \
-            iam.googleapis.com \
-            iap.googleapis.com \
-            oslogin.googleapis.com \
-            --project="${{ steps.cfg.outputs.project_id }}"
+          # The serviceUsageAdmin binding granted above can take a short while to
+          # propagate, so retry on the transient AUTH_PERMISSION_DENIED.
+          for attempt in $(seq 1 8); do
+            if gcloud services enable \
+              compute.googleapis.com \
+              iam.googleapis.com \
+              iap.googleapis.com \
+              oslogin.googleapis.com \
+              --project="${{ steps.cfg.outputs.project_id }}"; then
+              exit 0
+            fi
+            echo "services enable attempt ${attempt}/8 failed; waiting for IAM to propagate..."
+            sleep 15
+          done
+          echo "Failed to enable required APIs after retries"; exit 1
 
       - name: Ensure Terraform state bucket
         run: |
