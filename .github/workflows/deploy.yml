@@ -81,77 +81,17 @@ jobs:
             echo "state_bucket=${STATE_BUCKET}"
           } >> "${GITHUB_OUTPUT}"
 
-      - name: Bootstrap deploy service account IAM roles
-        run: |
-          set -euo pipefail
-          # The deploy SA is bootstrapped with roles/resourcemanager.projectIamAdmin
-          # (setIamPolicy) only. Self-grant the operational roles the rest of the
-          # deploy needs so the pipeline is self-contained. add-iam-policy-binding
-          # is idempotent, so re-runs are no-ops once the bindings exist.
-          #
-          # PREREQUISITE (one-time, by a project Owner): the Cloud Resource Manager
-          # API must be enabled, since projects get/setIamPolicy is served by it.
-          # The SA cannot enable it itself (that needs serviceUsageAdmin, which it
-          # can only obtain via this very step) -- a circular bootstrap. Run once:
-          #   gcloud services enable cloudresourcemanager.googleapis.com \
-          #     --project=<PROJECT_ID>
-          PROJECT_ID="${{ steps.cfg.outputs.project_id }}"
-          SA_EMAIL="$(jq -r '.client_email' "${GOOGLE_APPLICATION_CREDENTIALS}")"
-          [ -n "${SA_EMAIL}" ] && [ "${SA_EMAIL}" != "null" ] || { echo "Could not resolve deploy SA email"; exit 1; }
-
-          # Preflight: reading the project uses the Cloud Resource Manager API, the
-          # same API that setIamPolicy needs. If it is disabled, fail fast with the
-          # exact one-time remediation instead of a cryptic mid-loop 403.
-          if ! gcloud projects describe "${PROJECT_ID}" >/dev/null 2>&1; then
-            echo "ERROR: Cannot read project ${PROJECT_ID}. The Cloud Resource Manager" >&2
-            echo "API is almost certainly disabled, and this service account cannot"    >&2
-            echo "enable it itself (that needs serviceUsageAdmin, obtainable only via"   >&2
-            echo "the IAM grant below -- a circular bootstrap). A project Owner must"    >&2
-            echo "run this ONCE, then re-run the workflow:"                              >&2
-            echo "  gcloud services enable cloudresourcemanager.googleapis.com --project=${PROJECT_ID}" >&2
-            exit 1
-          fi
-
-          echo "Ensuring IAM roles for ${SA_EMAIL} on ${PROJECT_ID}"
-          # Every role the whole deploy needs, self-granted so the pipeline is
-          # self-contained (each is idempotent). Mapped to the operations that
-          # need it:
-          #   projectIamAdmin          - self-grant these bindings; preflight describe
-          #   serviceUsageAdmin        - gcloud services enable (the next step)
-          #   storage.admin            - create the TF state bucket + read/write state
-          #   compute.admin            - VPC/subnet/firewall/instance + instance IAM
-          #   iam.serviceAccountAdmin  - create the VM's dedicated service account
-          #   iam.serviceAccountUser   - actAs that SA to attach it to the VM
-          #   iap.admin                - IAP tunnel instance IAM + open the SSH tunnel
-          #   compute.osAdminLogin     - SSH into the VM as an OS Login admin (project
-          #                              wide, so login does not depend on Terraform's
-          #                              per-instance binding having propagated yet)
-          for ROLE in \
-            roles/resourcemanager.projectIamAdmin \
-            roles/serviceusage.serviceUsageAdmin \
-            roles/storage.admin \
-            roles/compute.admin \
-            roles/iam.serviceAccountAdmin \
-            roles/iam.serviceAccountUser \
-            roles/iap.admin \
-            roles/compute.osAdminLogin; do
-            gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-              --member="serviceAccount:${SA_EMAIL}" \
-              --role="${ROLE}" \
-              --condition=None \
-              --quiet >/dev/null
-          done
-
       - name: Enable required GCP APIs
         run: |
           set -euo pipefail
-          # Terraform provisions Compute Engine + IAM resources, which fail with
-          # a 403 SERVICE_DISABLED error if these APIs have never been enabled in
-          # the project. Enabling is idempotent and blocks until complete; doing
-          # it before the lengthy terraform init/plan also lets the activation
-          # propagate before the first apply (avoids the post-enable 403 race).
-          # The serviceUsageAdmin binding granted above can take a short while to
-          # propagate, so retry on the transient AUTH_PERMISSION_DENIED.
+          # Runs FIRST, using the SA's roles/serviceusage.serviceUsageAdmin. This
+          # turns on the Cloud Resource Manager API before the IAM bootstrap step,
+          # which needs it (project get/setIamPolicy is served by CRM) -- so the
+          # pipeline breaks its own bootstrap cycle with no manual step. Also
+          # enables the APIs Terraform provisions against; doing it before the
+          # lengthy init/plan lets activation propagate ahead of the first apply
+          # (avoids the post-enable 403 race). Idempotent; retry absorbs any
+          # propagation delay of the serviceUsageAdmin binding.
           for attempt in $(seq 1 8); do
             if gcloud services enable \
               cloudresourcemanager.googleapis.com \
@@ -161,12 +101,69 @@ jobs:
               iap.googleapis.com \
               oslogin.googleapis.com \
               --project="${{ steps.cfg.outputs.project_id }}"; then
-              exit 0
+              break
             fi
-            echo "services enable attempt ${attempt}/8 failed; waiting for IAM to propagate..."
+            [ "${attempt}" = "8" ] && { echo "Failed to enable required APIs after retries"; exit 1; }
+            echo "services enable attempt ${attempt}/8 failed; waiting for serviceUsageAdmin to propagate..."
             sleep 15
           done
-          echo "Failed to enable required APIs after retries"; exit 1
+
+      - name: Bootstrap deploy service account IAM roles
+        run: |
+          set -euo pipefail
+          # Self-grant every role the rest of the deploy needs so the pipeline is
+          # self-contained (each add-iam-policy-binding is idempotent). Requires the
+          # Cloud Resource Manager API (enabled in the previous step) and setIamPolicy
+          # (roles/resourcemanager.projectIamAdmin, pre-granted to the SA). Roles and
+          # the operations that need them:
+          #   projectIamAdmin          - self-grant these bindings
+          #   serviceUsageAdmin        - gcloud services enable (previous step)
+          #   storage.admin            - create the TF state bucket + read/write state
+          #   compute.admin            - VPC/subnet/firewall/instance + instance IAM
+          #   iam.serviceAccountAdmin  - create the VM's dedicated service account
+          #   iam.serviceAccountUser   - actAs that SA to attach it to the VM
+          #   iap.admin                - IAP tunnel instance IAM + open the SSH tunnel
+          #   compute.osAdminLogin     - SSH into the VM as an OS Login admin (project
+          #                              wide, so login does not depend on Terraform's
+          #                              per-instance binding having propagated yet)
+          PROJECT_ID="${{ steps.cfg.outputs.project_id }}"
+          SA_EMAIL="$(jq -r '.client_email' "${GOOGLE_APPLICATION_CREDENTIALS}")"
+          [ -n "${SA_EMAIL}" ] && [ "${SA_EMAIL}" != "null" ] || { echo "Could not resolve deploy SA email"; exit 1; }
+          echo "Ensuring IAM roles for ${SA_EMAIL} on ${PROJECT_ID}"
+
+          grant_all() {
+            local role
+            for role in \
+              roles/resourcemanager.projectIamAdmin \
+              roles/serviceusage.serviceUsageAdmin \
+              roles/storage.admin \
+              roles/compute.admin \
+              roles/iam.serviceAccountAdmin \
+              roles/iam.serviceAccountUser \
+              roles/iap.admin \
+              roles/compute.osAdminLogin; do
+              gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+                --member="serviceAccount:${SA_EMAIL}" \
+                --role="${role}" \
+                --condition=None \
+                --quiet >/dev/null || return 1
+            done
+          }
+
+          # The CRM API may have only just been enabled above; project setIamPolicy
+          # can 403 briefly until activation propagates. Retry before failing.
+          for attempt in $(seq 1 8); do
+            if grant_all; then
+              exit 0
+            fi
+            [ "${attempt}" = "8" ] && break
+            echo "IAM grant attempt ${attempt}/8 failed; waiting for API/IAM propagation..."
+            sleep 15
+          done
+          echo "ERROR: Could not self-grant IAM roles. Confirm the deploy service"  >&2
+          echo "account has roles/resourcemanager.projectIamAdmin and that the"     >&2
+          echo "Cloud Resource Manager API is enabled on ${PROJECT_ID}."            >&2
+          exit 1
 
       - name: Ensure Terraform state bucket
         run: |
