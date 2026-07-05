@@ -81,6 +81,21 @@ jobs:
             echo "state_bucket=${STATE_BUCKET}"
           } >> "${GITHUB_OUTPUT}"
 
+      - name: Enable required GCP APIs
+        run: |
+          set -euo pipefail
+          # Terraform provisions Compute Engine + IAM resources, which fail with
+          # a 403 SERVICE_DISABLED error if these APIs have never been enabled in
+          # the project. Enabling is idempotent and blocks until complete; doing
+          # it before the lengthy terraform init/plan also lets the activation
+          # propagate before the first apply (avoids the post-enable 403 race).
+          gcloud services enable \
+            compute.googleapis.com \
+            iam.googleapis.com \
+            iap.googleapis.com \
+            oslogin.googleapis.com \
+            --project="${{ steps.cfg.outputs.project_id }}"
+
       - name: Ensure Terraform state bucket
         run: |
           set -euo pipefail
