@@ -4,7 +4,7 @@ name: Deploy Hermes Agent
 # Nous Research Hermes Agent, configures Gemini (+ optional Telegram gateway
 # and other runtime config -- see the Render env file step and
 # docs/security.md), installs the systemd service, then strips the temporary
-# external IP and verifies the steady state.
+# external IPv4 unless Telegram polling needs outbound internet egress.
 #
 # Re-run this workflow any time you change a secret/variable it reads (e.g.
 # TELEGRAM_BOT_TOKEN, HERMES_EXTRA_ENV) -- it re-renders the env file on the
@@ -94,6 +94,42 @@ jobs:
             echo "workspace_dir=${WORKSPACE_DIR}"
             echo "state_bucket=${STATE_BUCKET}"
           } >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve steady-state egress mode
+        id: egress
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          HERMES_KEEP_EXTERNAL_IPV4: ${{ vars.HERMES_KEEP_EXTERNAL_IPV4 }}
+        run: |
+          set -euo pipefail
+          case "${HERMES_KEEP_EXTERNAL_IPV4:-auto}" in
+            auto|"")
+              if [ -n "${TELEGRAM_BOT_TOKEN}" ]; then
+                ALLOW_STEADY_EXTERNAL_IP="true"
+                echo "Telegram is enabled; keeping one ephemeral Standard-tier external IPv4 for outbound Telegram polling."
+                echo "This avoids Cloud NAT and is the lowest-cost reliable IPv4 egress path on GCE."
+              else
+                ALLOW_STEADY_EXTERNAL_IP="false"
+                echo "Telegram is disabled; steady state will have no external IPv4."
+              fi
+              ;;
+            true|1|yes)
+              ALLOW_STEADY_EXTERNAL_IP="true"
+              echo "HERMES_KEEP_EXTERNAL_IPV4 requested; steady state will keep an ephemeral external IPv4."
+              ;;
+            false|0|no)
+              ALLOW_STEADY_EXTERNAL_IP="false"
+              echo "HERMES_KEEP_EXTERNAL_IPV4=false; steady state will have no external IPv4."
+              if [ -n "${TELEGRAM_BOT_TOKEN}" ]; then
+                echo "WARNING: Telegram is enabled but external IPv4 is disabled; Telegram polling needs another outbound internet path."
+              fi
+              ;;
+            *)
+              echo "HERMES_KEEP_EXTERNAL_IPV4 must be auto, true, or false." >&2
+              exit 1
+              ;;
+          esac
+          echo "allow_steady_external_ip=${ALLOW_STEADY_EXTERNAL_IP}" >> "${GITHUB_OUTPUT}"
 
       - name: Enable required GCP APIs
         run: |
@@ -348,22 +384,30 @@ jobs:
           PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
         run: scripts/ssh-iap.sh down || true
 
-      - name: Terraform apply (steady state — remove external IP)
+      - name: Terraform apply (steady-state egress)
         working-directory: terraform
-        run: terraform apply -input=false -auto-approve -var="allow_temporary_external_ip=false"
+        run: terraform apply -input=false -auto-approve -var="allow_temporary_external_ip=${{ steps.egress.outputs.allow_steady_external_ip }}"
 
-      - name: Verify no external IP remains
+      - name: Verify steady-state external IPv4 mode
         run: |
           set -euo pipefail
           IP="$(gcloud compute instances describe '${{ steps.cfg.outputs.vm_name }}' \
                   --zone='${{ steps.cfg.outputs.zone }}' \
                   --project='${{ steps.cfg.outputs.project_id }}' \
                   --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null || true)"
-          if [ -n "${IP}" ]; then
-            echo "FAIL: VM still has an external IP (${IP})."
-            exit 1
+          if [ "${{ steps.egress.outputs.allow_steady_external_ip }}" = "true" ]; then
+            if [ -z "${IP}" ]; then
+              echo "FAIL: expected an ephemeral external IPv4 for Telegram outbound egress, but none is attached."
+              exit 1
+            fi
+            echo "OK: VM has an ephemeral external IPv4 for outbound Telegram polling. SSH remains IAP/firewall-only."
+          else
+            if [ -n "${IP}" ]; then
+              echo "FAIL: VM still has an external IPv4 (${IP})."
+              exit 1
+            fi
+            echo "OK: VM has no external IPv4 (Free-Tier steady state)."
           fi
-          echo "OK: VM has no external IPv4 (Free-Tier steady state)."
 
       - name: Clean up runner secrets
         if: always()
