@@ -16,9 +16,11 @@ set -euo pipefail
 HERMES_USER="${HERMES_USER:-hermes}"
 HERMES_HOME="${HERMES_HOME:-/home/hermes}"
 HERMES_CONFIG_DIR="${HERMES_CONFIG_DIR:-${HERMES_HOME}/.hermes}"
-# Cheap, agent-suitable default; override via HERMES_MODEL.
-HERMES_MODEL="${HERMES_MODEL:-gemini-flash-latest}"
-GEMINI_BASE_URL="${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta}"
+WORKSPACE_DIR="${WORKSPACE_DIR:-${HERMES_HOME}/workspace}"
+# Stable, agent-suitable default; override via HERMES_MODEL.
+HERMES_MODEL="${HERMES_MODEL:-gemini-3.5-flash}"
+# Gemini's OpenAI-compatible endpoint, per Google's API docs.
+GEMINI_BASE_URL="${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}"
 
 HERMES_BIN="${HERMES_HOME}/.local/bin/hermes"
 
@@ -29,6 +31,38 @@ run_hermes() {
     HERMES_HOME="${HERMES_CONFIG_DIR}" \
     HOME="${HERMES_HOME}" \
     "${HERMES_BIN}" "$@"
+}
+
+append_model_block() {
+  sudo -u "${HERMES_USER}" tee -a "${CONFIG_FILE}" >/dev/null <<YAML
+model:
+  default: ${HERMES_MODEL}
+  provider: gemini
+  base_url: ${GEMINI_BASE_URL}
+YAML
+}
+
+append_terminal_block() {
+  sudo -u "${HERMES_USER}" tee -a "${CONFIG_FILE}" >/dev/null <<YAML
+terminal:
+  backend: local
+  cwd: ${WORKSPACE_DIR}
+  timeout: 300
+YAML
+}
+
+remove_block() {
+  local key="$1"
+  local tmp_file
+  tmp_file="$(mktemp)"
+  awk -v key="${key}" '
+    BEGIN { skip=0 }
+    $0 ~ "^" key ":[[:space:]]*$" { skip=1; next }
+    skip && /^[^[:space:]]/ { skip=0 }
+    !skip { print }
+  ' "${CONFIG_FILE}" >"${tmp_file}"
+  install -o "${HERMES_USER}" -g "${HERMES_USER}" -m 0600 "${tmp_file}" "${CONFIG_FILE}"
+  rm -f "${tmp_file}"
 }
 
 log "Selecting Gemini provider and model '${HERMES_MODEL}'..."
@@ -42,32 +76,36 @@ log "Selecting Gemini provider and model '${HERMES_MODEL}'..."
 run_hermes config set model.provider gemini || true
 run_hermes config set model.base_url "${GEMINI_BASE_URL}" || true
 run_hermes config set model.default "${HERMES_MODEL}" || true
+run_hermes config set terminal.backend local || true
+run_hermes config set terminal.cwd "${WORKSPACE_DIR}" || true
+run_hermes config set terminal.timeout 300 || true
 
-# Verify the CLI actually recorded the gemini provider.
+# Verify the CLI actually recorded the essentials; repair blocks if not.
 CONFIG_FILE="${HERMES_CONFIG_DIR}/config.yaml"
 if sudo -u "${HERMES_USER}" grep -Eq '^model:[[:space:]]*$' "${CONFIG_FILE}" 2>/dev/null \
-   && sudo -u "${HERMES_USER}" grep -q 'provider: *gemini' "${CONFIG_FILE}" 2>/dev/null; then
+   && sudo -u "${HERMES_USER}" grep -q 'provider: *gemini' "${CONFIG_FILE}" 2>/dev/null \
+   && sudo -u "${HERMES_USER}" grep -q 'base_url: *https://generativelanguage.googleapis.com/v1beta/openai/' "${CONFIG_FILE}" 2>/dev/null; then
   log "Gemini provider recorded in config.yaml."
-elif sudo -u "${HERMES_USER}" grep -Eq '^model:[[:space:]]*$' "${CONFIG_FILE}" 2>/dev/null; then
-  # model: is a real block (nested) but doesn't name gemini: do NOT touch it
-  # (that could create a duplicate key / invalid YAML). Surface it for manual
-  # review rather than silently corrupting a config someone else set up.
-  log "WARNING: config.yaml has a model block that is not 'gemini'. Review it:"
-  log "  sudo -u ${HERMES_USER} sed -n '/^model:/,/^[^[:space:]]/p' ${CONFIG_FILE}"
 else
-  # No model key at all, OR model: is a bad flat scalar (e.g. left over from
-  # an older version of this script that used a bare, non-dotted `config set
-  # model ...`, clobbering the block into a plain string). Safe to repair:
-  # drop any single flat `model: <value>` line, then write the documented
-  # block fresh.
-  log "No usable model block found; writing the documented one directly."
+  log "Repairing config.yaml model block for Gemini."
+  sudo -u "${HERMES_USER}" touch "${CONFIG_FILE}"
   sudo -u "${HERMES_USER}" sed -i '/^model:[[:space:]]*[^[:space:]]/d' "${CONFIG_FILE}" 2>/dev/null || true
-  sudo -u "${HERMES_USER}" tee -a "${CONFIG_FILE}" >/dev/null <<YAML
-model:
-  default: ${HERMES_MODEL}
-  provider: gemini
-  base_url: ${GEMINI_BASE_URL}
-YAML
+  remove_block model
+  append_model_block
 fi
+
+if sudo -u "${HERMES_USER}" grep -Eq '^terminal:[[:space:]]*$' "${CONFIG_FILE}" 2>/dev/null \
+   && sudo -u "${HERMES_USER}" grep -q "cwd: *${WORKSPACE_DIR}" "${CONFIG_FILE}" 2>/dev/null; then
+  log "Terminal workspace recorded in config.yaml."
+else
+  log "Repairing config.yaml terminal block for local workspace execution."
+  sudo -u "${HERMES_USER}" touch "${CONFIG_FILE}"
+  remove_block terminal
+  append_terminal_block
+fi
+
+sudo -u "${HERMES_USER}" grep -q 'provider: *gemini' "${CONFIG_FILE}"
+sudo -u "${HERMES_USER}" grep -q 'base_url: *https://generativelanguage.googleapis.com/v1beta/openai/' "${CONFIG_FILE}"
+sudo -u "${HERMES_USER}" grep -q "cwd: *${WORKSPACE_DIR}" "${CONFIG_FILE}"
 
 log "Hermes configuration step complete."
