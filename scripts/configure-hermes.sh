@@ -17,14 +17,68 @@ HERMES_USER="${HERMES_USER:-hermes}"
 HERMES_HOME="${HERMES_HOME:-/home/hermes}"
 HERMES_CONFIG_DIR="${HERMES_CONFIG_DIR:-${HERMES_HOME}/.hermes}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-${HERMES_HOME}/workspace}"
-# Stable, agent-suitable default; override via HERMES_MODEL.
-HERMES_MODEL="${HERMES_MODEL:-gemini-3.5-flash}"
+# Stable, agent-suitable default; override via HERMES_MODEL. HERMES_MODEL may
+# also be an ordered fallback chain, e.g. "gemini-3.5-pro, gemini-3.5-flash".
+# The first entry becomes model.default; the rest become fallback_providers in
+# order, all using the Gemini provider.
+HERMES_MODEL_RAW="${HERMES_MODEL:-gemini-3.5-flash}"
 # Gemini's OpenAI-compatible endpoint, per Google's API docs.
 GEMINI_BASE_URL="${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}"
 
 HERMES_BIN="${HERMES_HOME}/.local/bin/hermes"
+declare -a HERMES_MODEL_CHAIN=()
+declare -a HERMES_MODEL_FALLBACKS=()
 
 log() { printf '[configure] %s\n' "$*"; }
+
+trim() {
+  local value="$*"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "${value}"
+}
+
+parse_model_chain() {
+  local raw="$1"
+  local entry
+  local -a entries=()
+
+  # GitHub repo variables are usually single-line, but support common ordered
+  # chain delimiters so users can write comma-, newline-, semicolon-, pipe-, or
+  # arrow-separated model lists.
+  raw="${raw//$'\r'/,}"
+  raw="${raw//$'\n'/,}"
+  raw="${raw//;/,}"
+  raw="${raw//|/,}"
+  raw="${raw//>/,}"
+
+  IFS=',' read -r -a entries <<<"${raw}"
+  for entry in "${entries[@]}"; do
+    entry="$(trim "${entry}")"
+    # Allow optional gemini: prefix for readability, while keeping model IDs as
+    # the actual values Hermes expects for the Gemini provider.
+    if [[ "${entry}" == gemini:* ]]; then
+      entry="${entry#gemini:}"
+      entry="$(trim "${entry}")"
+    fi
+    [ -n "${entry}" ] && HERMES_MODEL_CHAIN+=("${entry}")
+  done
+}
+
+yaml_quote() {
+  local escaped
+  escaped="$(printf '%s' "$1" | sed "s/'/''/g")"
+  printf "'%s'" "${escaped}"
+}
+
+parse_model_chain "${HERMES_MODEL_RAW}"
+if [ "${#HERMES_MODEL_CHAIN[@]}" -eq 0 ]; then
+  HERMES_MODEL_CHAIN=("gemini-3.5-flash")
+fi
+HERMES_MODEL="${HERMES_MODEL_CHAIN[0]}"
+if [ "${#HERMES_MODEL_CHAIN[@]}" -gt 1 ]; then
+  HERMES_MODEL_FALLBACKS=("${HERMES_MODEL_CHAIN[@]:1}")
+fi
 
 run_hermes() {
   sudo -u "${HERMES_USER}" \
@@ -34,12 +88,30 @@ run_hermes() {
 }
 
 append_model_block() {
+  local model_yaml
+  model_yaml="$(yaml_quote "${HERMES_MODEL}")"
   sudo -u "${HERMES_USER}" tee -a "${CONFIG_FILE}" >/dev/null <<YAML
 model:
-  default: ${HERMES_MODEL}
+  default: ${model_yaml}
   provider: gemini
   base_url: ${GEMINI_BASE_URL}
 YAML
+}
+
+append_fallback_providers_block() {
+  local model model_yaml
+  [ "${#HERMES_MODEL_FALLBACKS[@]}" -gt 0 ] || return 0
+
+  sudo -u "${HERMES_USER}" tee -a "${CONFIG_FILE}" >/dev/null <<YAML
+fallback_providers:
+YAML
+  for model in "${HERMES_MODEL_FALLBACKS[@]}"; do
+    model_yaml="$(yaml_quote "${model}")"
+    sudo -u "${HERMES_USER}" tee -a "${CONFIG_FILE}" >/dev/null <<YAML
+  - provider: gemini
+    model: ${model_yaml}
+YAML
+  done
 }
 
 append_terminal_block() {
@@ -65,7 +137,13 @@ remove_block() {
   rm -f "${tmp_file}"
 }
 
-log "Selecting Gemini provider and model '${HERMES_MODEL}'..."
+log "Selecting Gemini provider and primary model '${HERMES_MODEL}'..."
+if [ "${#HERMES_MODEL_FALLBACKS[@]}" -gt 0 ]; then
+  log "Configuring Gemini fallback models: ${HERMES_MODEL_FALLBACKS[*]}"
+else
+  log "No fallback models configured."
+fi
+
 # Primary path: the documented non-interactive CLI, all as dotted keys under
 # the same `model:` block (per the official config.yaml schema: `default`,
 # `provider`, `base_url`). Using a BARE `model` key here (no dot) would
@@ -80,8 +158,16 @@ run_hermes config set terminal.backend local || true
 run_hermes config set terminal.cwd "${WORKSPACE_DIR}" || true
 run_hermes config set terminal.timeout 300 || true
 
-# Verify the CLI actually recorded the essentials; repair blocks if not.
+# Write deterministic model/fallback blocks. Hermes fallback chains are stored as
+# top-level fallback_providers entries; rendering them here lets HERMES_MODEL stay
+# the single GitHub variable for both primary and ordered fallback model choice.
 CONFIG_FILE="${HERMES_CONFIG_DIR}/config.yaml"
+sudo -u "${HERMES_USER}" touch "${CONFIG_FILE}"
+remove_block model
+append_model_block
+remove_block fallback_providers
+append_fallback_providers_block
+
 if sudo -u "${HERMES_USER}" grep -Eq '^model:[[:space:]]*$' "${CONFIG_FILE}" 2>/dev/null \
    && sudo -u "${HERMES_USER}" grep -q 'provider: *gemini' "${CONFIG_FILE}" 2>/dev/null \
    && sudo -u "${HERMES_USER}" grep -q 'base_url: *https://generativelanguage.googleapis.com/v1beta/openai/' "${CONFIG_FILE}" 2>/dev/null; then
