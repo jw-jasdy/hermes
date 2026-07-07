@@ -62,6 +62,18 @@ dist/
 build/
 
 # ---------------------------------------------------------------------------
+# Generated tool/browser runtimes pulled from the VM snapshot
+# ---------------------------------------------------------------------------
+.hermes/bin/uv
+.hermes/node/bin/node
+workspace/ms-playwright/
+**/ms-playwright/
+**/chromium-*/
+**/chromium_headless_shell-*/
+**/chrome-linux64/
+**/chrome-headless-shell-linux64/
+
+# ---------------------------------------------------------------------------
 # OS / editor cruft
 # ---------------------------------------------------------------------------
 .DS_Store
