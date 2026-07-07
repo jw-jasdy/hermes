@@ -42,6 +42,24 @@ hermes-agent/dist/
 hermes-agent/build/
 hermes-agent/.git/
 
+# ---- Tool/browser runtimes (too large/generated) --------------------------
+# The VM may install local CLIs, Node, and Playwright browser bundles. Keep the
+# repo snapshot source/config oriented and avoid GitHub's 100 MB blob limit.
+bin/uv
+**/bin/uv
+node/bin/node
+**/node/bin/node
+ms-playwright/
+**/ms-playwright/
+chromium-*/
+**/chromium-*/
+chromium_headless_shell-*/
+**/chromium_headless_shell-*/
+chrome-linux64/
+**/chrome-linux64/
+chrome-headless-shell-linux64/
+**/chrome-headless-shell-linux64/
+
 # ---- Workspace build/dep artifacts ----------------------------------------
 node_modules/
 **/node_modules/
