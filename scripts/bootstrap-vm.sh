@@ -79,6 +79,8 @@ install_hermes_venv_package_if_missing() {
     log "WARNING: Could not install ${package_name} for ${purpose}."
     [ "${required}" = "1" ] && return 1
   fi
+
+  return 0
 }
 
 # --- 1. Minimal OS packages -------------------------------------------------
