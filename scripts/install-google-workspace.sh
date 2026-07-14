@@ -21,7 +21,11 @@ TARGET_SKILL_DIR="${HERMES_CONFIG_DIR}/skills/productivity/google-workspace"
 install -d -o root -g root -m 0755 "${TARGET_LIB_DIR}"
 install -o root -g root -m 0755 "${SCRIPT_DIR}/google-workspace-oauth.py" "${TARGET_HELPER}"
 install -o root -g root -m 0755 "${SCRIPT_DIR}/hermes-google-workspace.sh" "${TARGET_OAUTH_WRAPPER}"
-install -o root -g root -m 0755 "${SCRIPT_DIR}/hermes-google-api.sh" "${TARGET_API_WRAPPER}"
+if [ -f "${SCRIPT_DIR}/hermes-google-api.sh" ]; then
+  install -o root -g root -m 0755 "${SCRIPT_DIR}/hermes-google-api.sh" "${TARGET_API_WRAPPER}"
+else
+  echo "WARNING: Google API wrapper source not present; OAuth helper only was installed." >&2
+fi
 install -d -o "${HERMES_USER}" -g "${HERMES_GROUP}" -m 0700 "${HERMES_CONFIG_DIR}"
 
 if [ -f "${SKILL_SOURCE}" ]; then
