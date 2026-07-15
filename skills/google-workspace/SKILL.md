@@ -1,7 +1,7 @@
 ---
 name: google-workspace
-description: "Personal Gmail, Calendar, and an optional folder-bound Drive/Docs/Sheets workspace through repository-managed OAuth. Always prefer this skill over Himalaya for configured Google services."
-version: 1.2.0
+description: "Managed personal Google services for Gmail, Calendar, Contacts, and a folder-bound Drive/Docs/Sheets workspace. Use this skill for every configured Google service request."
+version: 1.3.0
 platforms: [linux]
 required_credential_files:
   - path: google_token.json
@@ -10,27 +10,34 @@ required_credential_files:
     description: Google OAuth2 Desktop client
 metadata:
   hermes:
-    tags: [Google, Gmail, Calendar, Drive, Docs, Sheets, Email, OAuth]
+    tags: [Google, Gmail, Calendar, Contacts, People, Drive, Docs, Sheets, Email, OAuth]
 ---
 
 # Google Workspace — managed Hermes deployment
 
-Use the repository-managed integrations for Gmail, Calendar, Drive, Docs, and
-Sheets. Gmail/Calendar and Drive use separate OAuth tokens so Drive access can be
-revoked independently.
+Use the repository-managed integrations for Gmail, Calendar, Google Contacts,
+Drive, Docs, and Sheets. The services use separately stored least-privilege
+OAuth tokens. Contacts uses the People API with read/write access, while Drive,
+Docs, and Sheets remain restricted to the app-owned `hermes` folder.
 
-Both runtime clients use only Python's standard library. They do **not** import
+All runtime clients use only Python's standard library. They do **not** import
 `googleapiclient`, `google-auth`, or any pip package.
 
 ## Routing rules
 
-1. For Gmail, Google Calendar, Drive, Docs, or Sheets requests, use this skill.
-2. Do **not** switch to `himalaya` merely because a request mentions email only.
-3. Do **not** run `pip`, `pip install`, `setup.py`, or `ensurepip`.
-4. Use the exact scripts and `/usr/bin/python3`; do not depend on shell `PATH`.
-5. If a script is missing, report that **Google Workspace Runtime Repair** must
+1. For Gmail, Google Calendar, Google Contacts, People API, Drive, Docs, or
+   Sheets requests, use this skill.
+2. A request mentioning a contact, contact list, address book, person, phone
+   number, or saved email address must use the Contacts client below. Do not
+   substitute Drive, Docs, Sheets, or a contact spreadsheet.
+3. Never claim Contacts are unavailable before testing the Contacts runtime and
+   token with the documented health command.
+4. Do **not** switch to `himalaya` merely because a request mentions email only.
+5. Do **not** run `pip`, `pip install`, `setup.py`, or `ensurepip`.
+6. Use the exact scripts and `/usr/bin/python3`; do not depend on shell `PATH`.
+7. If a script is missing, report that **Google Workspace Runtime Repair** must
    be run.
-6. Never broaden Drive access or use another Drive tool. Drive, Docs, and Sheets
+8. Never broaden Drive access or use another Drive tool. Drive, Docs, and Sheets
    operations must go through the folder-bound client described below.
 
 ## Exact runtime paths
@@ -38,8 +45,11 @@ Both runtime clients use only Python's standard library. They do **not** import
 ```bash
 GAPI="${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-workspace/scripts/google_api.py"
 DAPI="${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-workspace/scripts/google_drive.py"
+CAPI="${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-contacts/scripts/google_contacts.py"
+
 test -f "$GAPI" || { echo "Google Workspace Runtime Repair is required: $GAPI is missing" >&2; exit 1; }
 test -f "$DAPI" || { echo "Google Workspace Runtime Repair is required: $DAPI is missing" >&2; exit 1; }
+test -f "$CAPI" || { echo "Google Workspace Runtime Repair is required: $CAPI is missing" >&2; exit 1; }
 ```
 
 Run them only as:
@@ -47,6 +57,7 @@ Run them only as:
 ```bash
 /usr/bin/python3 "$GAPI"
 /usr/bin/python3 "$DAPI"
+/usr/bin/python3 "$CAPI"
 ```
 
 ## Gmail and Calendar health check
@@ -98,6 +109,81 @@ do not modify mail unless explicitly requested.
 Do not create, update, delete, or invite attendees without explicit approval.
 Use Asia/Singapore when the user provides no other timezone.
 
+## Google Contacts
+
+Contacts uses a separate read/write token at
+`~/.hermes/google_contacts_token.json` and the People API.
+
+### Contacts health check
+
+Run before the first Contacts operation in a conversation:
+
+```bash
+/usr/bin/python3 "$CAPI" check
+```
+
+A healthy response contains `"contactsReachable": true`,
+`"scope": "https://www.googleapis.com/auth/contacts"`, and
+`"runtime": "python-stdlib"`.
+
+When the Contacts token is missing, tell the operator to run **Google Workspace
+Setup** with `service=contacts`. Do not redirect the user to a spreadsheet and
+do not start OAuth from Telegram.
+
+### List, search, and read contacts
+
+These read operations do not require confirmation:
+
+```bash
+/usr/bin/python3 "$CAPI" list --max 100
+/usr/bin/python3 "$CAPI" search "Ada" --max 25
+/usr/bin/python3 "$CAPI" get people/CONTACT_ID
+```
+
+Search before acting when a name is ambiguous. Use only a `people/...` resource
+name returned by this client; never invent or guess a contact ID.
+
+### Create contacts
+
+Only after explicit user confirmation:
+
+```bash
+/usr/bin/python3 "$CAPI" create \
+  --given-name "Ada" \
+  --family-name "Lovelace" \
+  --email "ada@example.com" \
+  --phone "+65 6123 4567" \
+  --company "Example Ltd" \
+  --job-title "Engineer"
+```
+
+Multiple `--email`, `--phone`, and `--url` flags are supported.
+
+### Update or clear contact fields
+
+Only after explicit user confirmation. The client fetches the latest People API
+metadata and etag before updating:
+
+```bash
+/usr/bin/python3 "$CAPI" update people/CONTACT_ID \
+  --email "new@example.com" \
+  --phone "+65 6987 6543"
+
+/usr/bin/python3 "$CAPI" update people/CONTACT_ID --clear-phones
+/usr/bin/python3 "$CAPI" update people/CONTACT_ID --clear-notes
+```
+
+Supported writable fields are names, email addresses, phone numbers, company,
+job title, notes, birthday, and URLs.
+
+### Delete contacts
+
+Only after explicit user confirmation:
+
+```bash
+/usr/bin/python3 "$CAPI" delete people/CONTACT_ID
+```
+
 ## Drive workspace boundary
 
 Drive authorization is deliberately limited to the non-sensitive `drive.file`
@@ -130,7 +216,7 @@ A healthy response contains `"ready": true`, folder name `"hermes"`, and
 `"boundary": "direct-children-only"`.
 
 When `google_drive_token.json` is missing, tell the operator to run **Google
-Drive Workspace OAuth**. Do not start OAuth from Telegram yourself.
+Workspace Setup** with `service=drive`. Do not start OAuth from Telegram.
 
 ### Drive files
 
@@ -182,11 +268,11 @@ folder-bound client.
 
 ## Operator-managed workflows
 
-- **Google Workspace Runtime Repair** installs both clients and validates their
-  exact active paths after every successful deploy.
-- **Google Workspace OAuth** manages the Gmail/Calendar token.
-- **Google Drive Workspace OAuth** manages the separate `drive.file` token,
-  creates the app-owned `hermes` folder, checks it, or revokes access.
+- **Google Workspace Setup** manages the separately stored `core`, `contacts`,
+  and `drive` authorization domains.
+- **Google Workspace Runtime Repair** installs all managed clients and skills,
+  restarts Hermes, and validates every authorized service.
 
 The complete browser-only procedures are documented in
-`GOOGLE_WORKSPACE_SETUP.md` and `docs/google-drive-workspace.md`.
+`GOOGLE_WORKSPACE_SETUP.md`, `docs/google-contacts.md`, and
+`docs/google-drive-workspace.md`.
