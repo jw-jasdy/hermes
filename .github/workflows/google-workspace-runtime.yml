@@ -1,8 +1,7 @@
 name: Google Workspace Runtime Repair
 
-# Installs the repository-managed Google Workspace skill and dependency-free
-# Gmail/Calendar plus folder-bound Drive/Docs/Sheets clients. Runs after every
-# successful deploy and can also be dispatched manually for immediate repair.
+# Idempotently restores all managed Google runtime clients and skills after every
+# successful Hermes deploy. Existing OAuth tokens and Drive state are preserved.
 on:
   workflow_run:
     workflows:
@@ -42,11 +41,14 @@ jobs:
           if [ -z "${PROJECT_ID}" ]; then
             PROJECT_ID="$(jq -r '.project_id' "${GOOGLE_APPLICATION_CREDENTIALS}")"
           fi
-          [ -n "${PROJECT_ID}" ] && [ "${PROJECT_ID}" != "null" ] || { echo "Could not resolve project_id"; exit 1; }
+          [ -n "${PROJECT_ID}" ] && [ "${PROJECT_ID}" != "null" ] || {
+            echo "Could not resolve project_id" >&2
+            exit 1
+          }
 
-          ZONE="${{ vars.GCP_ZONE }}";            ZONE="${ZONE:-us-central1-a}"
-          VM_NAME="${{ vars.GCP_VM_NAME }}";      VM_NAME="${VM_NAME:-hermes-agent}"
-          HERMES_USER="${{ vars.HERMES_USER }}";  HERMES_USER="${HERMES_USER:-hermes}"
+          ZONE="${{ vars.GCP_ZONE }}"; ZONE="${ZONE:-us-central1-a}"
+          VM_NAME="${{ vars.GCP_VM_NAME }}"; VM_NAME="${VM_NAME:-hermes-agent}"
+          HERMES_USER="${{ vars.HERMES_USER }}"; HERMES_USER="${HERMES_USER:-hermes}"
           HERMES_USER_HOME="${{ vars.HERMES_HOME }}"; HERMES_USER_HOME="${HERMES_USER_HOME:-/home/hermes}"
 
           {
@@ -58,7 +60,7 @@ jobs:
             echo "hermes_config_dir=${HERMES_USER_HOME}/.hermes"
           } >> "${GITHUB_OUTPUT}"
 
-      - name: Enable Google Workspace APIs
+      - name: Ensure Google APIs
         run: |
           set -euo pipefail
           gcloud services enable \
@@ -67,6 +69,7 @@ jobs:
             drive.googleapis.com \
             docs.googleapis.com \
             sheets.googleapis.com \
+            people.googleapis.com \
             --project="${{ steps.cfg.outputs.project_id }}"
 
       - name: Establish ephemeral SSH over IAP
@@ -81,7 +84,7 @@ jobs:
           ENV_FILE="$(scripts/ssh-iap.sh up)"
           echo "env_file=${ENV_FILE}" >> "${GITHUB_OUTPUT}"
 
-      - name: Install managed Google Workspace runtime
+      - name: Install and verify managed Google runtimes
         env:
           HERMES_USER: ${{ steps.cfg.outputs.hermes_user }}
           HERMES_USER_HOME: ${{ steps.cfg.outputs.hermes_user_home }}
@@ -99,18 +102,24 @@ jobs:
             sleep 5
           done
 
-          ${SSH} 'sudo rm -rf /tmp/hermes-google-runtime && install -d -m 0700 /tmp/hermes-google-runtime/google-workspace-skill'
+          ${SSH} 'sudo rm -rf /tmp/hermes-google-runtime && install -d -m 0700 /tmp/hermes-google-runtime/google-workspace-skill /tmp/hermes-google-runtime/google-contacts-skill'
           ${SCP} scripts/google-workspace-oauth.py \
                  scripts/google-workspace-api.py \
                  scripts/google-drive-oauth.py \
                  scripts/google-drive-workspace.py \
+                 scripts/google-contacts-oauth.py \
+                 scripts/google-contacts-api.py \
                  scripts/hermes-google-workspace.sh \
                  scripts/hermes-google-api.sh \
                  scripts/hermes-google-drive.sh \
+                 scripts/hermes-google-contacts.sh \
                  scripts/install-google-workspace.sh \
+                 scripts/install-google-contacts.sh \
                  "${SSH_USER}@localhost:/tmp/hermes-google-runtime/"
           ${SCP} skills/google-workspace/SKILL.md \
                  "${SSH_USER}@localhost:/tmp/hermes-google-runtime/google-workspace-skill/SKILL.md"
+          ${SCP} skills/google-contacts/SKILL.md \
+                 "${SSH_USER}@localhost:/tmp/hermes-google-runtime/google-contacts-skill/SKILL.md"
 
           ${SSH} "sudo env \
             HERMES_USER='${HERMES_USER}' \
@@ -122,14 +131,26 @@ jobs:
             DRIVE_OAUTH_SOURCE='/tmp/hermes-google-runtime/google-drive-oauth.py' \
             bash /tmp/hermes-google-runtime/install-google-workspace.sh"
 
+          ${SSH} "sudo env \
+            HERMES_USER='${HERMES_USER}' \
+            HERMES_USER_HOME='${HERMES_USER_HOME}' \
+            HERMES_CONFIG_DIR='${HERMES_CONFIG_DIR}' \
+            CONTACTS_OAUTH_SOURCE='/tmp/hermes-google-runtime/google-contacts-oauth.py' \
+            CONTACTS_API_SOURCE='/tmp/hermes-google-runtime/google-contacts-api.py' \
+            CONTACTS_SKILL_SOURCE='/tmp/hermes-google-runtime/google-contacts-skill/SKILL.md' \
+            bash /tmp/hermes-google-runtime/install-google-contacts.sh"
+
           ${SSH} 'sudo systemctl restart hermes-agent.service'
 
           ACTIVE_API="${HERMES_CONFIG_DIR}/skills/productivity/google-workspace/scripts/google_api.py"
           ACTIVE_DRIVE="${HERMES_CONFIG_DIR}/skills/productivity/google-workspace/scripts/google_drive.py"
+          ACTIVE_CONTACTS="${HERMES_CONFIG_DIR}/skills/productivity/google-contacts/scripts/google_contacts.py"
           ${SSH} "sudo -u '${HERMES_USER}' test -x '${ACTIVE_API}'"
           ${SSH} "sudo -u '${HERMES_USER}' test -x '${ACTIVE_DRIVE}'"
+          ${SSH} "sudo -u '${HERMES_USER}' test -x '${ACTIVE_CONTACTS}'"
           ${SSH} "sudo -u '${HERMES_USER}' grep -q 'Dependency-free Gmail' '${ACTIVE_API}'"
           ${SSH} "sudo -u '${HERMES_USER}' grep -q 'direct children of one app-owned Drive folder' '${ACTIVE_DRIVE}'"
+          ${SSH} "sudo -u '${HERMES_USER}' grep -q 'Google Contacts CLI' '${ACTIVE_CONTACTS}'"
 
           if ${SSH} "sudo -u '${HERMES_USER}' test -f '${HERMES_CONFIG_DIR}/google_token.json'"; then
             ${SSH} "sudo -u '${HERMES_USER}' env \
@@ -142,9 +163,20 @@ jobs:
               HERMES_HOME='${HERMES_CONFIG_DIR}' \
               HERMES_CONFIG_DIR='${HERMES_CONFIG_DIR}' \
               /usr/bin/python3 '${ACTIVE_API}' gmail labels >/dev/null"
-            echo "AGENT_RUNTIME_READY_STDLIB: active skill client passed Gmail and Calendar without googleapiclient."
+            echo "AGENT_RUNTIME_READY_STDLIB: Gmail and Calendar checks passed."
           else
-            echo "GOOGLE_RUNTIME_READY_NOT_AUTHENTICATED: complete the Google Workspace OAuth workflow."
+            echo "GOOGLE_CORE_AUTHORIZATION_REQUIRED: run Google Workspace Setup with service=core."
+          fi
+
+          if ${SSH} "sudo -u '${HERMES_USER}' test -f '${HERMES_CONFIG_DIR}/google_contacts_token.json'"; then
+            ${SSH} "sudo -u '${HERMES_USER}' env \
+              HOME='${HERMES_USER_HOME}' \
+              HERMES_HOME='${HERMES_CONFIG_DIR}' \
+              HERMES_CONFIG_DIR='${HERMES_CONFIG_DIR}' \
+              /usr/bin/python3 '${ACTIVE_CONTACTS}' check"
+            echo "GOOGLE_CONTACTS_READY: People API read/write access passed."
+          else
+            echo "GOOGLE_CONTACTS_AUTHORIZATION_REQUIRED: run Google Workspace Setup with service=contacts."
           fi
 
           if ${SSH} "sudo -u '${HERMES_USER}' test -f '${HERMES_CONFIG_DIR}/google_drive_token.json'"; then
@@ -158,9 +190,9 @@ jobs:
               HERMES_HOME='${HERMES_CONFIG_DIR}' \
               HERMES_CONFIG_DIR='${HERMES_CONFIG_DIR}' \
               /usr/bin/python3 '${ACTIVE_DRIVE}' workspace status"
-            echo "GOOGLE_DRIVE_FOLDER_READY: Drive, Docs, and Sheets are restricted to the app-owned hermes folder."
+            echo "GOOGLE_DRIVE_FOLDER_READY: Drive, Docs, and Sheets are restricted to hermes."
           else
-            echo "GOOGLE_DRIVE_AUTHORIZATION_REQUIRED: run Google Drive Workspace OAuth once."
+            echo "GOOGLE_DRIVE_AUTHORIZATION_REQUIRED: run Google Workspace Setup with service=drive."
           fi
 
       - name: Remove temporary VM files
