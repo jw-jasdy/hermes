@@ -1,14 +1,15 @@
 # Folder-bound Google Drive, Docs, and Sheets
 
-Hermes can use Google Drive, Docs, and Sheets through a separate OAuth token
-that grants only:
+Hermes can use Google Drive, Docs, and Sheets through a separately stored OAuth
+token whose requested Drive permission is only:
 
 ```text
 https://www.googleapis.com/auth/drive.file
 ```
 
-This is deliberately separate from the Gmail and Calendar token. Revoking Drive
-access does not disconnect Gmail or Calendar.
+The Drive token is stored separately from the Gmail and Calendar token. Both
+flows reuse the same Google Desktop OAuth client, so after revoking either token,
+run both live checks in case Google invalidates other grants for that client.
 
 ## Security boundary
 
@@ -164,5 +165,6 @@ Run:
 Google Drive Workspace OAuth → revoke
 ```
 
-This revokes and deletes the Drive token. It does not delete the `hermes` folder
-or its files, and it does not revoke Gmail or Calendar access.
+This deletes the stored Drive token and leaves the `hermes` folder and its files
+in Google Drive. Because the Gmail/Calendar and Drive flows use the same Desktop
+OAuth client, run **Google Workspace OAuth → `check`** afterward as well.
